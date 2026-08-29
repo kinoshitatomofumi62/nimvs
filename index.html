@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>三山崩し (Nim Battle) - WebRTC P2P通信対戦対応</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&family=Press+Start+2P&display=swap" rel="stylesheet">
+  <!-- React & Babel CDN for standalone single-file execution -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Lucide Icons CDN -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- QRCode CDN -->
+  <script src="https://unpkg.com/qrcode-generator@1.4.4/qrcode.js"></script>
+
+  <style>
+    body {
+      background-color: #05050a;
+      color: #00ff66;
+      font-family: 'DotGothic16', monospace;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .crt-overlay {
+      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
+                  linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+      background-size: 100% 3px, 3px 100%;
+      pointer-events: none;
+    }
+    .box-glow-green { box-shadow: 0 0 10px rgba(0, 255, 102, 0.35); }
+    .box-glow-cyan { box-shadow: 0 0 10px rgba(0, 240, 255, 0.35); }
+    .box-glow-yellow { box-shadow: 0 0 10px rgba(255, 230, 0, 0.35); }
+    .box-glow-magenta { box-shadow: 0 0 10px rgba(255, 0, 127, 0.35); }
+    @keyframes pixelBlink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0; }
+    }
+    .animate-pixel-blink { animation: pixelBlink 0.8s infinite; }
+  </style>
+</head>
+<body class="bg-[#05050a] min-h-screen text-[#00ff66]">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // --- Audio Synthesizer (Web Audio API) ---
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.isMuted = false;
+      }
+      init() {
+        if (!this.ctx && typeof window !== 'undefined') {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (AudioContext) this.ctx = new AudioContext();
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume();
+        }
+      }
+      toggleMute() {
+        this.isMuted = !this.isMuted;
+        return this.isMuted;
+      }
+      playTone(freq, duration, type = 'square', gainVal = 0.1) {
+        if (this.isMuted) return;
+        this.init();
+        if (!this.ctx) return;
+        try {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+          gain.gain.setValueAtTime(gainVal, this.ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + duration);
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+          osc.start();
+          osc.stop(this.ctx.currentTime + duration);
+        } catch(e){}
+      }
+      playSelect() { this.playTone(660, 0.06, 'square', 0.08); }
+      playTake() {
+        this.playTone(440, 0.05, 'triangle', 0.1);
+        setTimeout(() => this.playTone(880, 0.08, 'square', 0.1), 50);
+      }
+      playWin() {
+        [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+          setTimeout(() => this.playTone(f, 0.15, 'square', 0.12), i * 110);
+        });
+      }
+      playError() { this.playTone(150, 0.2, 'sawtooth', 0.15); }
+      playTurnChange() { this.playTone(550, 0.07, 'triangle', 0.08); }
+      playCpuTick() { this.playTone(330, 0.04, 'sine', 0.05); }
+    }
+    const sound = new SoundEngine();
+
+    // --- Nim AI (Nim-sum Optimal Algorithm) ---
+    function getCpuMove(heaps, ruleType) {
+      const nimSum = heaps.reduce((acc, count) => acc ^ count, 0);
+      const activeHeaps = heaps.map((count, index) => ({ count, index })).filter(h => h.count > 0);
+      if (activeHeaps.length === 0) return { heapIndex: 0, takeCount: 1, explanation: '' };
+
+      if (ruleType === 'misere') {
+        const moreThanOneCount = heaps.filter(c => c > 1).length;
+        if (moreThanOneCount <= 1) {
+          const nonZeroCount = activeHeaps.length;
+          const targetHeap = activeHeaps.find(h => h.count > 1);
+          if (targetHeap) {
+            const leavesOdd = (nonZeroCount - 1) % 2 === 1;
+            const takeCount = leavesOdd ? targetHeap.count : targetHeap.count - 1;
+            return {
+              heapIndex: targetHeap.index,
+              takeCount: Math.max(1, takeCount),
+              explanation: '【メゼル終盤戦術】奇数個の単独山を残して勝利を確定させました！'
+            };
+          }
+        }
+      }
+
+      if (nimSum !== 0) {
+        for (let i = 0; i < heaps.length; i++) {
+          const count = heaps[i];
+          const target = count ^ nimSum;
+          if (target < count) {
+            return {
+              heapIndex: i,
+              takeCount: count - target,
+              explanation: `【Nim-sum最適手】山${i + 1}から${count - target}個取り、ニム和を0に調整！`
+            };
+          }
+        }
+      }
+
+      const largest = [...activeHeaps].sort((a, b) => b.count - a.count)[0];
+      return {
+        heapIndex: largest.index,
+        takeCount: 1,
+        explanation: '【ランダム手】劣勢のため山から1個取って様子見します。'
+      };
+    }
+
+    // --- Deflate / Compression Helper for WebRTC ---
+    async function compressSDP(str) {
+      try {
+        if (typeof CompressionStream !== 'undefined') {
+          const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+          const buffer = await new Response(stream).arrayBuffer();
+          let binary = '';
+          const bytes = new Uint8Array(buffer);
+          for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+          return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+      } catch(e){}
+      return btoa(unescape(encodeURIComponent(str)));
+    }
+
+    async function decompressSDP(code) {
+      try {
+        let base64 = code.replace(/-/g, '+').replace(/_/g, '/');
+        while (base64.length % 4) base64 += '=';
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        if (typeof DecompressionStream !== 'undefined') {
+          const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+          return await new Response(stream).text();
+        }
+      } catch(e){}
+      try { return decodeURIComponent(escape(atob(code.trim()))); } catch(e){}
+      return '';
+    }
+
+    // --- WebRTC P2P Manager ---
+    const ICE_SERVERS = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    };
+
+    class P2PConnection {
+      constructor() {
+        this.peer = null;
+        this.dataChannel = null;
+        this.broadcastChannel = null;
+        this.onMessageCallback = null;
+        this.onStatusChangeCallback = null;
+        this.role = null;
+        this.initBroadcastChannel();
+      }
+      initBroadcastChannel() {
+        if (typeof BroadcastChannel !== 'undefined') {
+          this.broadcastChannel = new BroadcastChannel('nim_local_p2p_channel');
+          this.broadcastChannel.onmessage = (event) => {
+            const { type, payload, offer } = event.data || {};
+            if (type === 'LOCAL_AUTO_DISCOVER_REQUEST' && this.role === 'host') {
+              if (this.isConnected()) return;
+              if (this.peer && this.peer.localDescription) {
+                this.broadcastChannel.postMessage({
+                  type: 'LOCAL_AUTO_DISCOVER_OFFER',
+                  offer: { type: String(this.peer.localDescription.type), sdp: String(this.peer.localDescription.sdp) }
+                });
+              }
+            } else if (type === 'LOCAL_AUTO_DISCOVER_OFFER' && this.role === 'guest') {
+              const rawOffer = offer || payload;
+              if (rawOffer) this.handleAutoOffer(rawOffer);
+            } else if (type === 'LOCAL_AUTO_DISCOVER_ANSWER' && this.role === 'host') {
+              if (this.peer && payload) {
+                this.peer.setRemoteDescription(new RTCSessionDescription({ type: payload.type, sdp: payload.sdp })).catch(()=>{});
+              }
+            }
+          };
+        }
+      }
+      async handleAutoOffer(offer) {
+        if (!this.peer || this.role !== 'guest') return;
+        try {
+          await this.peer.setRemoteDescription(new RTCSessionDescription({ type: offer.type, sdp: offer.sdp }));
+          const answer = await this.peer.createAnswer();
+          await this.peer.setLocalDescription(answer);
+          this.broadcastChannel.postMessage({
+            type: 'LOCAL_AUTO_DISCOVER_ANSWER',
+            payload: { type: String(answer.type), sdp: String(answer.sdp) }
+          });
+        } catch(e){}
+      }
+      setCallbacks(onMsg, onStatus) {
+        this.onMessageCallback = onMsg;
+        this.onStatusChangeCallback = onStatus;
+      }
+      isConnected() { return this.dataChannel && this.dataChannel.readyState === 'open'; }
+      async createRoom() {
+        this.cleanup();
+        this.role = 'host';
+        this.onStatusChangeCallback?.('creating_offer');
+        return new Promise((resolve, reject) => {
+          try {
+            const peer = new RTCPeerConnection(ICE_SERVERS);
+            this.peer = peer;
+            const dc = peer.createDataChannel('nim-game-channel', { ordered: true });
+            this.setupDC(dc);
+            peer.createOffer().then(o => peer.setLocalDescription(o));
+            let resolved = false;
+            peer.onicecandidate = async (ev) => {
+              if (!ev.candidate && !resolved && peer.localDescription) {
+                resolved = true;
+                const minSdp = JSON.stringify({ t: 1, s: peer.localDescription.sdp });
+                const code = await compressSDP(minSdp);
+                this.onStatusChangeCallback?.('waiting_answer');
+                resolve(code);
+              }
+            };
+            setTimeout(async () => {
+              if (!resolved && peer.localDescription) {
+                resolved = true;
+                const minSdp = JSON.stringify({ t: 1, s: peer.localDescription.sdp });
+                const code = await compressSDP(minSdp);
+                this.onStatusChangeCallback?.('waiting_answer');
+                resolve(code);
+              }
+            }, 1500);
+          } catch(e){ reject(e); }
+        });
+      }
+      async joinRoom(hostCode) {
+        this.cleanup();
+        this.role = 'guest';
+        this.onStatusChangeCallback?.('creating_answer');
+        return new Promise(async (resolve, reject) => {
+          try {
+            const decomp = await decompressSDP(hostCode);
+            const parsed = JSON.parse(decomp);
+            const peer = new RTCPeerConnection(ICE_SERVERS);
+            this.peer = peer;
+            peer.ondatachannel = (ev) => this.setupDC(ev.channel);
+            await peer.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: parsed.s }));
+            const answer = await peer.createAnswer();
+            await peer.setLocalDescription(answer);
+            let resolved = false;
+            peer.onicecandidate = async (ev) => {
+              if (!ev.candidate && !resolved && peer.localDescription) {
+                resolved = true;
+                const minSdp = JSON.stringify({ t: 2, s: peer.localDescription.sdp });
+                const code = await compressSDP(minSdp);
+                this.onStatusChangeCallback?.('connecting');
+                resolve(code);
+              }
+            };
+            setTimeout(async () => {
+              if (!resolved && peer.localDescription) {
+                resolved = true;
+                const minSdp = JSON.stringify({ t: 2, s: peer.localDescription.sdp });
+                const code = await compressSDP(minSdp);
+                this.onStatusChangeCallback?.('connecting');
+                resolve(code);
+              }
+            }, 1500);
+          } catch(e){
+            this.onStatusChangeCallback?.('disconnected', '無効なコードです');
+            reject(e);
+          }
+        });
+      }
+      async acceptGuestAnswer(guestCode) {
+        if (!this.peer) throw new Error('Host not ready');
+        const decomp = await decompressSDP(guestCode);
+        const parsed = JSON.parse(decomp);
+        await this.peer.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: parsed.s }));
+      }
+      setupDC(dc) {
+        this.dataChannel = dc;
+        dc.onopen = () => this.onStatusChangeCallback?.('connected');
+        dc.onclose = () => this.onStatusChangeCallback?.('disconnected');
+        dc.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            this.onMessageCallback?.(msg);
+          } catch(e){}
+        };
+      }
+      sendMessage(msg) {
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+          this.dataChannel.send(JSON.stringify(msg));
+          return true;
+        }
+        return false;
+      }
+      cleanup() {
+        if (this.dataChannel) { this.dataChannel.close(); this.dataChannel = null; }
+        if (this.peer) { this.peer.close(); this.peer = null; }
+        this.role = null;
+      }
+    }
+    const p2p = new P2PConnection();
+
+    // --- Main React Component ---
+    function App() {
+      const [gameMode, setGameMode] = useState('cpu'); // 'cpu' | 'pvp' | 'p2p'
+      const [ruleType, setRuleType] = useState('normal'); // 'normal' | 'misere'
+      const [initialHeaps, setInitialHeaps] = useState([3, 5, 7]);
+      const [firstPlayer, setFirstPlayer] = useState(1);
+
+      const [heaps, setHeaps] = useState([3, 5, 7]);
+      const [currentTurn, setCurrentTurn] = useState(1);
+      const [winner, setWinner] = useState(null);
+      const [isCpuThinking, setIsCpuThinking] = useState(false);
+      const [cpuMessage, setCpuMessage] = useState(null);
+      const [history, setHistory] = useState([]);
+
+      const [selectedHeapIndex, setSelectedHeapIndex] = useState(null);
+      const [takeCount, setTakeCount] = useState(1);
+
+      const [isMuted, setIsMuted] = useState(false);
+      const [showCrt, setShowCrt] = useState(true);
+      const [showP2PModal, setShowP2PModal] = useState(false);
+      const [showRulesModal, setShowRulesModal] = useState(false);
+      const [p2pRole, setP2pRole] = useState(null);
+
+      // P2P callbacks
+      useEffect(() => {
+        p2p.setCallbacks(
+          (msg) => {
+            if (msg.type === 'MOVE' && msg.payload) {
+              const { heapIndex, takeCount } = msg.payload;
+              if (heapIndex !== undefined && takeCount !== undefined) {
+                sound.playTake();
+                executeMove(heapIndex, takeCount, false, false);
+              }
+            } else if (msg.type === 'INIT_GAME' && msg.payload) {
+              const { heaps: newH, ruleType: newR, firstPlayer: newF } = msg.payload;
+              resetGame('p2p', newR, newH, newF, false);
+            } else if (msg.type === 'RESTART') {
+              resetGame('p2p', ruleType, initialHeaps, firstPlayer, false);
+            }
+          },
+          (status) => {
+            if (status === 'disconnected' && gameMode === 'p2p') {
+              setP2pRole(null);
+              setGameMode('cpu');
+            }
+          }
+        );
+      }, [gameMode, ruleType, initialHeaps, firstPlayer, heaps, currentTurn]);
+
+      const resetGame = (mode = gameMode, rule = ruleType, custHeaps = initialHeaps, startP = firstPlayer, broadcast = true) => {
+        setGameMode(mode);
+        setRuleType(rule);
+        setInitialHeaps([...custHeaps]);
+        setFirstPlayer(startP);
+        setHeaps([...custHeaps]);
+        setCurrentTurn(startP);
+        setWinner(null);
+        setIsCpuThinking(false);
+        setCpuMessage(null);
+        setHistory([]);
+        setSelectedHeapIndex(null);
+        setTakeCount(1);
+        if (mode === 'p2p' && broadcast) {
+          p2p.sendMessage({ type: 'RESTART' });
+        }
+      };
+
+      const executeMove = (heapIndex, count, isCpu = false, broadcast = true) => {
+        if (winner !== null || heaps[heapIndex] < count || count <= 0) return;
+        const next = [...heaps];
+        next[heapIndex] -= count;
+        setHeaps(next);
+
+        const activeP = currentTurn;
+        setHistory(prev => [...prev, {
+          player: activeP,
+          isCpu,
+          heapIndex,
+          takeCount: count,
+          remainingHeaps: next,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+
+        if (gameMode === 'p2p' && broadcast) {
+          p2p.sendMessage({ type: 'MOVE', payload: { heapIndex, takeCount: count, sender: activeP } });
+        }
+
+        const totalRem = next.reduce((a, b) => a + b, 0);
+        if (totalRem === 0) {
+          const gameWin = ruleType === 'normal' ? activeP : (activeP === 1 ? 2 : 1);
+          setWinner(gameWin);
+          sound.playWin();
+          setIsCpuThinking(false);
+          return;
+        }
+
+        const nextP = activeP === 1 ? 2 : 1;
+        setCurrentTurn(nextP);
+        sound.playTurnChange();
+      };
+
+      // CPU AI Trigger
+      useEffect(() => {
+        if (winner !== null || gameMode !== 'cpu' || currentTurn !== 2) return;
+        setIsCpuThinking(true);
+        sound.playCpuTick();
+        const tid = setTimeout(() => {
+          const move = getCpuMove(heaps, ruleType);
+          setCpuMessage(move.explanation);
+          sound.playTake();
+          setIsCpuThinking(false);
+          executeMove(move.heapIndex, move.takeCount, true, false);
+        }, 500);
+        return () => clearTimeout(tid);
+      }, [currentTurn, gameMode, winner, heaps, ruleType]);
+
+      const myPlayerNum = p2pRole === 'guest' ? 2 : 1;
+      const isHumanTurn = gameMode === 'pvp' ? true : (gameMode === 'p2p' ? currentTurn === myPlayerNum : currentTurn === 1);
+
+      return (
+        <div className="relative min-h-screen flex flex-col justify-between">
+          {showCrt && <div className="fixed inset-0 crt-overlay z-40" />}
+
+          {/* Header */}
+          <header className="border-b-4 border-[#00ff66] bg-[#0a0a14] px-4 py-3">
+            <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-4 h-4 bg-[#00ff66] animate-pixel-blink" />
+                <h1 className="text-xl sm:text-2xl font-bold tracking-wider">
+                  三山崩し <span className="text-xs sm:text-sm text-[#00f0ff] font-['Press_Start_2P',monospace]">NIM BATTLE</span>
+                </h1>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); setShowP2PModal(true); }}
+                  className={`px-3 py-1.5 border-2 text-xs font-bold flex items-center gap-1.5 cursor-pointer ${
+                    gameMode === 'p2p' ? 'border-[#00f0ff] text-[#00f0ff] bg-[#002b33] box-glow-cyan' : 'border-[#00f0ff] text-[#00f0ff] hover:bg-[#002b33]'
+                  }`}
+                >
+                  <span>{gameMode === 'p2p' ? '📡 P2P接続中' : '📡 通信対戦'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); setShowCrt(!showCrt); }}
+                  className={`px-2.5 py-1.5 border-2 text-xs cursor-pointer ${showCrt ? 'border-[#00f0ff] text-[#00f0ff] bg-[#002b33]' : 'border-zinc-700 text-zinc-500'}`}
+                >
+                  CRT
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => { const m = sound.toggleMute(); setIsMuted(m); sound.playSelect(); }}
+                  className={`px-2.5 py-1.5 border-2 text-xs cursor-pointer ${!isMuted ? 'border-[#ffe600] text-[#ffe600] bg-[#332e00]' : 'border-zinc-700 text-zinc-500'}`}
+                >
+                  {isMuted ? 'MUTE' : 'SOUND'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); setShowRulesModal(true); }}
+                  className="px-2.5 py-1.5 border-2 border-[#ff007f] text-[#ff007f] hover:bg-[#33001a] text-xs cursor-pointer"
+                >
+                  ルール
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); resetGame(); }}
+                  className="px-2.5 py-1.5 border-2 border-[#00ff66] text-[#00ff66] hover:bg-[#003314] text-xs cursor-pointer"
+                >
+                  リセット
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Area */}
+          <main className="flex-1 max-w-4xl w-full mx-auto p-3 sm:p-6 space-y-4">
+            {/* Status Bar */}
+            <div className="bg-[#0f111a] border-2 border-[#00ff66] p-3 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-zinc-400 font-bold">MODE:</span>
+                <span className="px-2 py-0.5 border border-[#00ff66] bg-[#003314]">
+                  {gameMode === 'cpu' ? '1P vs CPU' : (gameMode === 'p2p' ? `P2P対戦 (${p2pRole === 'host' ? '1P' : '2P'})` : '1P vs 2P')}
+                </span>
+                <span className="text-zinc-400 font-bold ml-2">RULE:</span>
+                <span className={`px-2 py-0.5 border ${ruleType === 'normal' ? 'border-[#00f0ff] text-[#00f0ff] bg-[#002b33]' : 'border-[#ff007f] text-[#ff007f] bg-[#33001a]'}`}>
+                  {ruleType === 'normal' ? 'ノーマル (取って勝利)' : 'メゼル (取って敗北)'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); resetGame(gameMode, ruleType === 'normal' ? 'misere' : 'normal'); }}
+                  className="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-600 text-xs cursor-pointer"
+                >
+                  ルール切替
+                </button>
+              </div>
+            </div>
+
+            {/* Turn Banner */}
+            <div className={`p-3 border-2 flex items-center justify-between gap-3 ${
+              isCpuThinking ? 'border-[#ffe600] bg-[#241f00] text-[#ffe600]' :
+              currentTurn === 1 ? 'border-[#00ff66] bg-[#00260e] text-[#00ff66]' : 'border-[#00f0ff] bg-[#001f26] text-[#00f0ff]'
+            }`}>
+              <div>
+                <div className="text-xs text-zinc-400">CURRENT TURN</div>
+                <div className="text-base sm:text-lg font-bold font-['Press_Start_2P',monospace]">
+                  {isCpuThinking ? 'CPU THINKING...' :
+                   gameMode === 'p2p' ? (currentTurn === myPlayerNum ? 'あなたの手番 (YOU)' : '相手の手番 (WAITING...)') :
+                   currentTurn === 1 ? '1P の手番 (YOU)' : (gameMode === 'cpu' ? 'CPU の手番' : '2P の手番')}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] text-zinc-400">REMAINING STONES</div>
+                <div className="text-base font-bold font-['Press_Start_2P',monospace]">
+                  {heaps.reduce((a,b)=>a+b, 0)} 個
+                </div>
+              </div>
+            </div>
+
+            {cpuMessage && (
+              <div className="p-2.5 bg-[#141026] border border-[#b026ff] text-xs text-[#d893ff]">
+                💡 {cpuMessage}
+              </div>
+            )}
+
+            {/* Playfield */}
+            <div className="bg-[#0b0c16] border-2 border-zinc-700 p-4 sm:p-6 min-h-[300px] flex flex-col justify-between">
+              <div className="text-center text-xs text-zinc-400 mb-4">
+                {isCpuThinking ? 'CPUが思考中です...' :
+                 !isHumanTurn && gameMode === 'p2p' ? '相手の操作を待っています...' :
+                 selectedHeapIndex === null ? '石を取りたい山をクリックしてください' :
+                 `山 ${selectedHeapIndex + 1} から ${takeCount} 個取ります。決定ボタンを押してください。`}
+              </div>
+
+              {/* Heaps Display */}
+              <div className="flex flex-wrap items-end justify-center gap-4 sm:gap-8 my-4">
+                {heaps.map((count, hIdx) => {
+                  const isSelected = selectedHeapIndex === hIdx;
+                  return (
+                    <div
+                      key={hIdx}
+                      onClick={() => {
+                        if (!isHumanTurn || isCpuThinking || count === 0) return;
+                        sound.playSelect();
+                        if (isSelected) {
+                          setTakeCount(takeCount >= count ? 1 : takeCount + 1);
+                        } else {
+                          setSelectedHeapIndex(hIdx);
+                          setTakeCount(1);
+                        }
+                      }}
+                      className={`flex flex-col items-center p-3 border-2 cursor-pointer transition-all ${
+                        isSelected ? 'border-[#00ff66] bg-[#003314]/80 box-glow-green scale-105' :
+                        count === 0 ? 'border-zinc-800 bg-black/40 opacity-40' : 'border-zinc-700 bg-[#12131f] hover:border-zinc-500'
+                      }`}
+                    >
+                      <div className="text-xs font-bold mb-2">山 {hIdx + 1}</div>
+                      {/* Stones stack */}
+                      <div className="flex flex-col-reverse gap-1 items-center min-h-[140px] justify-start">
+                        {Array.from({ length: count }).map((_, sIdx) => {
+                          const isTaking = isSelected && sIdx >= (count - takeCount);
+                          return (
+                            <div
+                              key={sIdx}
+                              className={`w-9 h-4 sm:w-11 sm:h-5 border border-black transition-all ${
+                                isTaking ? 'bg-[#ff007f] box-glow-magenta animate-pulse' :
+                                isSelected ? 'bg-[#00ff66]' : 'bg-[#00f0ff]'
+                              }`}
+                            />
+                          );
+                        })}
+                      </div>
+                      <div className="text-xs font-bold font-['Press_Start_2P',monospace] mt-2 text-white">
+                        {count}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Action Controls */}
+              {selectedHeapIndex !== null && isHumanTurn && !isCpuThinking && (
+                <div className="p-3 bg-[#12131f] border border-[#00ff66] flex flex-wrap items-center justify-between gap-3 animate-fadeIn">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-zinc-300">取る個数:</span>
+                    <button
+                      type="button"
+                      onClick={() => { sound.playSelect(); setTakeCount(Math.max(1, takeCount - 1)); }}
+                      className="w-7 h-7 bg-zinc-800 border border-zinc-600 text-white font-bold text-sm cursor-pointer"
+                    >
+                      -
+                    </button>
+                    <span className="text-base font-bold text-white px-2 font-['Press_Start_2P',monospace]">
+                      {takeCount}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { sound.playSelect(); setTakeCount(Math.min(heaps[selectedHeapIndex], takeCount + 1)); }}
+                      className="w-7 h-7 bg-zinc-800 border border-zinc-600 text-white font-bold text-sm cursor-pointer"
+                    >
+                      +
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { sound.playSelect(); setTakeCount(heaps[selectedHeapIndex]); }}
+                      className="px-2 py-1 bg-zinc-800 text-xs text-[#ffe600] border border-zinc-600 cursor-pointer"
+                    >
+                      全取得
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playTake();
+                      executeMove(selectedHeapIndex, takeCount, false, true);
+                      setSelectedHeapIndex(null);
+                      setTakeCount(1);
+                    }}
+                    className="px-6 py-2 bg-[#00ff66] hover:bg-[#33ff88] text-black font-bold text-sm cursor-pointer shadow-[0_3px_0_0_#008833] active:translate-y-0.5 active:shadow-none"
+                  >
+                    この手で決定する！
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Move History */}
+            {history.length > 0 && (
+              <div className="bg-[#0c0d17] border border-zinc-800 p-3 max-h-36 overflow-y-auto text-xs space-y-1">
+                <div className="text-zinc-500 font-bold mb-1">【対局履歴】</div>
+                {history.map((rec, i) => (
+                  <div key={i} className="flex justify-between border-b border-zinc-900 pb-0.5">
+                    <span className={rec.player === 1 ? 'text-[#00ff66]' : 'text-[#00f0ff]'}>
+                      第{i + 1}手: {rec.player === 1 ? '1P' : (rec.isCpu ? 'CPU' : '2P')} ➜ 山{rec.heapIndex + 1}から {rec.takeCount} 個取得
+                    </span>
+                    <span className="text-zinc-500">残: [{rec.remainingHeaps.join('-')}]</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </main>
+
+          {/* Footer */}
+          <footer className="border-t border-zinc-800 bg-[#080811] py-3 px-4 text-center text-xs text-zinc-500">
+            三山崩し (Nim Battle) &copy; Single-File HTML Standalone Edition &bull; WebRTC P2P
+          </footer>
+
+          {/* Victory Modal */}
+          {winner !== null && (
+            <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
+              <div className="bg-[#0a0a14] border-4 border-[#ffe600] p-6 max-w-sm w-full text-center space-y-4 box-glow-yellow">
+                <div className="text-3xl">👑</div>
+                <h2 className="text-xl font-bold font-['Press_Start_2P',monospace] text-[#ffe600]">
+                  {winner === 1 ? '1P の勝利！' : (gameMode === 'cpu' ? 'CPU の勝利！' : '2P の勝利！')}
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  {ruleType === 'normal' ? '最後の石を取りました！' : '相手に最後の石を取らせました！'}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => { sound.playSelect(); resetGame(); }}
+                  className="w-full py-3 bg-[#00ff66] hover:bg-[#33ff88] text-black font-bold text-sm cursor-pointer shadow-[0_4px_0_0_#008833] active:translate-y-1 active:shadow-none"
+                >
+                  もう一度遊ぶ
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* P2P Lobby Modal */}
+          {showP2PModal && (
+            <P2PModalComponent
+              onClose={() => setShowP2PModal(false)}
+              onConnected={(role) => {
+                setP2pRole(role);
+                setShowP2PModal(false);
+                resetGame('p2p', ruleType, initialHeaps, firstPlayer, true);
+                if (role === 'host') {
+                  p2p.sendMessage({ type: 'INIT_GAME', payload: { heaps: initialHeaps, ruleType, firstPlayer } });
+                }
+              }}
+            />
+          )}
+
+          {/* Rules Modal */}
+          {showRulesModal && (
+            <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
+              <div className="bg-[#0a0a14] border-4 border-[#ff007f] p-6 max-w-md w-full text-zinc-300 space-y-3 box-glow-magenta">
+                <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
+                  <h3 className="text-base font-bold text-[#ff007f]">三山崩し（ニム）のルール</h3>
+                  <button type="button" onClick={() => setShowRulesModal(false)} className="text-zinc-400 hover:text-white">✕</button>
+                </div>
+                <div className="text-xs space-y-2 leading-relaxed">
+                  <p>1. プレイヤーは自分の手番に、<strong>いずれか1つの山</strong>を選んで<strong>1個以上の石</strong>を取ります。</p>
+                  <p>2. 1度に取れる個数に上限はなく、山にある石をすべて取っても構いません。</p>
+                  <p>3. <strong>【ノーマルルール】</strong>: 最後の石を取ったプレイヤーが<strong>「勝ち」</strong>になります。</p>
+                  <p>4. <strong>【メゼルルール】</strong>: 最後の石を取らされたプレイヤーが<strong>「負け」</strong>になります。</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowRulesModal(false)}
+                  className="w-full py-2 bg-[#ff007f] text-white font-bold text-xs cursor-pointer"
+                >
+                  閉じる
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // --- P2P Lobby Sub Component ---
+    function P2PModalComponent({ onClose, onConnected }) {
+      const [tab, setTab] = useState('create');
+      const [status, setStatus] = useState('disconnected');
+      const [statusError, setStatusError] = useState(null);
+
+      const [hostOfferCode, setHostOfferCode] = useState('');
+      const [guestAnswerInput, setGuestAnswerInput] = useState('');
+      const [isGeneratingOffer, setIsGeneratingOffer] = useState(false);
+      const [copiedOffer, setCopiedOffer] = useState(false);
+
+      const [joinOfferInput, setJoinOfferInput] = useState('');
+      const [guestAnswerCode, setGuestAnswerCode] = useState('');
+      const [isGeneratingAnswer, setIsGeneratingAnswer] = useState(false);
+      const [copiedAnswer, setCopiedAnswer] = useState(false);
+
+      useEffect(() => {
+        p2p.setCallbacks(
+          () => {},
+          (newStatus, error) => {
+            setStatus(newStatus);
+            if (error) setStatusError(error);
+            if (newStatus === 'connected') {
+              sound.playWin();
+              onConnected(p2p.role);
+            }
+          }
+        );
+      }, [onConnected]);
+
+      const handleCreateRoom = async () => {
+        sound.playSelect();
+        setIsGeneratingOffer(true);
+        setStatusError(null);
+        try {
+          const code = await p2p.createRoom();
+          setHostOfferCode(code);
+          setIsGeneratingOffer(false);
+        } catch(e){
+          setIsGeneratingOffer(false);
+          setStatusError('部屋作成に失敗しました');
+        }
+      };
+
+      const handleAcceptGuest = async () => {
+        if (!guestAnswerInput.trim()) return;
+        sound.playSelect();
+        try {
+          await p2p.acceptGuestAnswer(guestAnswerInput.trim());
+        } catch(e){
+          setStatusError('応答コードの承認に失敗しました');
+        }
+      };
+
+      const handleJoinSubmit = async () => {
+        if (!joinOfferInput.trim()) return;
+        sound.playSelect();
+        setIsGeneratingAnswer(true);
+        try {
+          const code = await p2p.joinRoom(joinOfferInput.trim());
+          setGuestAnswerCode(code);
+          setIsGeneratingAnswer(false);
+        } catch(e){
+          setIsGeneratingAnswer(false);
+          setStatusError('無効な招待コードです');
+        }
+      };
+
+      const handleLocalAuto = () => {
+        sound.playSelect();
+        if (typeof BroadcastChannel !== 'undefined') {
+          const bc = new BroadcastChannel('nim_local_p2p_channel');
+          bc.postMessage({ type: 'LOCAL_AUTO_DISCOVER_REQUEST' });
+        }
+      };
+
+      const copyText = (txt, isOffer) => {
+        sound.playSelect();
+        navigator.clipboard.writeText(txt);
+        if (isOffer) { setCopiedOffer(true); setTimeout(()=>setCopiedOffer(false), 2000); }
+        else { setCopiedAnswer(true); setTimeout(()=>setCopiedAnswer(false), 2000); }
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-3 z-50">
+          <div className="bg-[#0a0a14] border-4 border-[#00f0ff] p-4 sm:p-6 max-w-lg w-full text-zinc-200 box-glow-cyan space-y-4">
+            <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
+              <h2 className="text-base font-bold text-[#00f0ff]">WebRTC P2P 通信対戦 (API不要)</h2>
+              <button type="button" onClick={() => { p2p.cleanup(); onClose(); }} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+
+            <div className="p-2 bg-[#001f26] border border-[#00f0ff]/40 text-xs text-[#80f8ff] flex justify-between items-center">
+              <span>ブラウザ間直接通信（サーバーレス）</span>
+              <button
+                type="button"
+                onClick={handleLocalAuto}
+                className="px-2 py-1 bg-[#ffe600] text-black font-bold text-[11px] cursor-pointer"
+              >
+                ⚡ 同PC別タブと即接続
+              </button>
+            </div>
+
+            {/* Tab */}
+            <div className="flex gap-2 border-b border-zinc-800 pb-2">
+              <button
+                type="button"
+                onClick={() => setTab('create')}
+                className={`flex-1 py-1.5 text-xs font-bold border cursor-pointer ${tab === 'create' ? 'border-[#00ff66] bg-[#003314] text-[#00ff66]' : 'border-zinc-800 bg-[#12131f] text-zinc-400'}`}
+              >
+                部屋を作る (ホスト/1P)
+              </button>
+              <button
+                type="button"
+                onClick={() => setTab('join')}
+                className={`flex-1 py-1.5 text-xs font-bold border cursor-pointer ${tab === 'join' ? 'border-[#ffe600] bg-[#332e00] text-[#ffe600]' : 'border-zinc-800 bg-[#12131f] text-zinc-400'}`}
+              >
+                部屋に参加 (ゲスト/2P)
+              </button>
+            </div>
+
+            {statusError && <div className="p-2 bg-red-950 text-red-300 text-xs border border-red-700">{statusError}</div>}
+
+            {tab === 'create' && (
+              <div className="space-y-3 text-xs">
+                {!hostOfferCode ? (
+                  <div className="text-center py-4">
+                    <button
+                      type="button"
+                      onClick={handleCreateRoom}
+                      disabled={isGeneratingOffer}
+                      className="px-5 py-2.5 bg-[#00ff66] hover:bg-[#33ff88] text-black font-bold text-xs cursor-pointer shadow-[0_3px_0_0_#008833] active:translate-y-0.5 active:shadow-none"
+                    >
+                      {isGeneratingOffer ? 'コード生成中...' : '短縮招待コードを発行する'}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="p-2.5 bg-[#12131f] border border-zinc-700 space-y-1.5">
+                      <div className="flex justify-between text-xs text-[#00ff66] font-bold">
+                        <span>STEP 1: 招待コードを相手に送る</span>
+                        <button type="button" onClick={() => copyText(hostOfferCode, true)} className="px-2 py-0.5 bg-[#00ff66] text-black font-bold">
+                          {copiedOffer ? 'コピー完了！' : 'コピー'}
+                        </button>
+                      </div>
+                      <textarea readOnly value={hostOfferCode} rows={2} className="w-full bg-black text-[#00ff66] p-1 font-mono text-[11px] select-all break-all resize-none" />
+                    </div>
+
+                    <div className="p-2.5 bg-[#12131f] border border-zinc-700 space-y-1.5">
+                      <div className="text-xs text-[#ffe600] font-bold">STEP 2: 相手の「応答コード」を貼って開始</div>
+                      <textarea placeholder="応答コードを貼り付け..." value={guestAnswerInput} onChange={e=>setGuestAnswerInput(e.target.value)} rows={2} className="w-full bg-black text-[#ffe600] p-1 font-mono text-[11px] break-all resize-none" />
+                      <button
+                        type="button"
+                        onClick={handleAcceptGuest}
+                        disabled={!guestAnswerInput.trim() || status === 'connecting'}
+                        className="w-full py-2 bg-[#00f0ff] text-black font-bold text-xs cursor-pointer"
+                      >
+                        {status === 'connecting' ? '接続中...' : '応答コードを認証して対戦開始'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {tab === 'join' && (
+              <div className="space-y-3 text-xs">
+                <div className="p-2.5 bg-[#12131f] border border-zinc-700 space-y-1.5">
+                  <div className="text-xs text-[#00ff66] font-bold">STEP 1: ホストの「招待コード」を貼る</div>
+                  <textarea placeholder="招待コードを貼り付け..." value={joinOfferInput} onChange={e=>setJoinOfferInput(e.target.value)} rows={2} className="w-full bg-black text-[#00ff66] p-1 font-mono text-[11px] break-all resize-none" />
+                  <button
+                    type="button"
+                    onClick={handleJoinSubmit}
+                    disabled={!joinOfferInput.trim() || isGeneratingAnswer}
+                    className="w-full py-2 bg-[#ffe600] text-black font-bold text-xs cursor-pointer"
+                  >
+                    {isGeneratingAnswer ? '作成中...' : '応答コードを作成'}
+                  </button>
+                </div>
+
+                {guestAnswerCode && (
+                  <div className="p-2.5 bg-[#12131f] border border-[#ffe600] space-y-1.5">
+                    <div className="flex justify-between text-xs text-[#ffe600] font-bold">
+                      <span>STEP 2: この「応答コード」をホストに送る</span>
+                      <button type="button" onClick={() => copyText(guestAnswerCode, false)} className="px-2 py-0.5 bg-[#ffe600] text-black font-bold">
+                        {copiedAnswer ? 'コピー完了！' : 'コピー'}
+                      </button>
+                    </div>
+                    <textarea readOnly value={guestAnswerCode} rows={2} className="w-full bg-black text-[#ffe600] p-1 font-mono text-[11px] select-all break-all resize-none" />
+                    <div className="text-zinc-400 text-center text-[11px]">ホストが承認すると自動で始まります...</div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
